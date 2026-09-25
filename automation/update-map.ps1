@@ -60,15 +60,25 @@ try {
         throw "No encuentro uNmINeD CLI en '$unminedCli'. Corrige automation\config.json."
     }
 
+    $renderOkMarker = Join-Path $renderDir ".render-ok"
+
+    if ((Test-Path $renderDir) -and -not (Test-Path $renderOkMarker)) {
+        Write-Host "Limpiando una exportación anterior incompleta..."
+        Remove-Item $renderDir -Recurse -Force
+    }
+
     New-Item -ItemType Directory -Force -Path $renderDir | Out-Null
 
     Write-Host ""
     Write-Host "2/3 Actualizando el mapa con uNmINeD..."
-    & $unminedCli web render "--world=$worldDir" "--output=$renderDir"
+    Write-Host "Formato de tiles: WebP"
+    & $unminedCli web render "--world=$worldDir" "--output=$renderDir" "--imageformat=webp"
 
     if ($LASTEXITCODE -ne 0) {
         throw "uNmINeD terminó con código $LASTEXITCODE."
     }
+
+    Set-Content -Path $renderOkMarker -Value (Get-Date).ToString("o") -Encoding ASCII
 
     $unminedIndex = Join-Path $renderDir "unmined.index.html"
     $webIndex = Join-Path $renderDir "index.html"
