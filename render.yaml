@@ -14,9 +14,11 @@ services:
       - key: UPDATE_INTERVAL_MINUTES
         value: "60"
       - key: ZOOM_IN
-        value: "3"
+        value: "2"
       - key: ZOOM_OUT
-        value: "8"
+        value: "10"
+      - key: CLIENT_EXTRA_ZOOM
+        value: "4"
       - key: UNMINED_CHUNK_PROCESSORS
         value: "1"
       - key: UNMINED_GC_HEAP_LIMIT
