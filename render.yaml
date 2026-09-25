@@ -5,8 +5,8 @@ services:
     plan: free
     region: oregon
     autoDeployTrigger: off
-    buildCommand: cd render && npm install && bash install-unmined.sh
-    startCommand: cd render && npm start
+    buildCommand: npm install && bash install-unmined.sh
+    startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: REALM_ID
