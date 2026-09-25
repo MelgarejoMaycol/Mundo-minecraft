@@ -21,5 +21,11 @@ services:
         value: "1"
       - key: UNMINED_GC_HEAP_LIMIT
         value: "10000000"
+      - key: TILE_CACHE_SECONDS
+        value: "600"
+      - key: ASSET_CACHE_SECONDS
+        value: "3600"
+      - key: REFRESH_TOKEN
+        sync: false
       - key: AUTH_CACHE_ZIP_BASE64
         sync: false
