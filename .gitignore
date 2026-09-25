@@ -9,3 +9,8 @@ automation/logs/
 # Vercel local
 .vercel/
 **/.vercel/
+render/node_modules/
+render/.unmined/
+render/.unmined-download/
+render/.data/
+auth-cache.zip
