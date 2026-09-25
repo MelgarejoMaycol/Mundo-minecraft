@@ -4,7 +4,7 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node render/server.js"
+    "start": "node --max-old-space-size=128 render/server.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
