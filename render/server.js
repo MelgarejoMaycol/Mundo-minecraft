@@ -1,5 +1,6 @@
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
 const { spawn } = require('child_process')
 const AdmZip = require('adm-zip')
 const express = require('express')
@@ -14,6 +15,7 @@ const workDir = path.join(dataDir, 'work')
 const worldDir = path.join(workDir, 'world')
 const downloadDir = path.join(workDir, 'download')
 const mapDir = path.join(dataDir, 'map')
+const metadataPath = path.join(dataDir, 'map-state.json')
 const mcworldPath = path.join(downloadDir, 'realm.mcworld')
 const unminedCli = process.env.UNMINED_CLI || path.join(renderDir, '.unmined', 'unmined-cli')
 
@@ -23,20 +25,40 @@ const zoomIn = Math.max(0, Number(process.env.ZOOM_IN || 3))
 const zoomOut = Math.max(0, Number(process.env.ZOOM_OUT || 8))
 const chunkProcessors = Math.max(1, Number(process.env.UNMINED_CHUNK_PROCESSORS || 1))
 const unminedHeapLimit = process.env.UNMINED_GC_HEAP_LIMIT || '10000000'
+const tileCacheSeconds = Math.max(60, Number(process.env.TILE_CACHE_SECONDS || 600))
+const assetCacheSeconds = Math.max(300, Number(process.env.ASSET_CACHE_SECONDS || 3600))
+const refreshToken = String(process.env.REFRESH_TOKEN || '')
 const port = Number(process.env.PORT || 10000)
 
 const app = express()
 
+function loadMetadata () {
+  try {
+    return JSON.parse(fs.readFileSync(metadataPath, 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+function saveMetadata (metadata) {
+  fs.mkdirSync(dataDir, { recursive: true })
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2))
+}
+
+const persisted = loadMetadata()
+
 const state = {
-  ready: false,
+  ready: fs.existsSync(path.join(mapDir, 'index.html')),
   running: false,
   realmId,
-  realmName: null,
-  activeSlot: null,
+  realmName: persisted.realmName || null,
+  activeSlot: persisted.activeSlot || null,
   lastStartedAt: null,
   lastFinishedAt: null,
-  lastSuccessAt: null,
+  lastSuccessAt: persisted.lastSuccessAt || null,
+  lastRealmHash: persisted.lastRealmHash || null,
   lastError: null,
+  lastAction: null,
   updateMinutes,
   zoomIn,
   zoomOut,
@@ -49,6 +71,24 @@ function log (...args) {
 
 function sleep (ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function compactMemory () {
+  if (global.gc) {
+    try {
+      global.gc()
+    } catch {}
+  }
+}
+
+function memorySnapshot () {
+  const m = process.memoryUsage()
+  return {
+    rssMb: Math.round(m.rss / 1024 / 1024),
+    heapUsedMb: Math.round(m.heapUsed / 1024 / 1024),
+    heapTotalMb: Math.round(m.heapTotal / 1024 / 1024),
+    externalMb: Math.round(m.external / 1024 / 1024)
+  }
 }
 
 function isTransientNetworkError (error) {
@@ -110,6 +150,7 @@ function restoreAuthCacheFromEnv () {
     const zip = new AdmZip(Buffer.from(encoded.replace(/\s+/g, ''), 'base64'))
     zip.extractAllTo(authDir, true)
     log('Cache de autenticacion Microsoft restaurada desde variable segura.')
+    compactMemory()
   } catch (error) {
     log('No se pudo restaurar AUTH_CACHE_ZIP_BASE64:', error.message)
   }
@@ -149,7 +190,7 @@ async function getRealms (api) {
   return Array.isArray(result) ? result : []
 }
 
-async function downloadRealm () {
+async function downloadRealm ({ force = false } = {}) {
   const api = createApi()
   const realms = await getRealms(api)
   const realm = realms.find(item => String(item.id) === realmId)
@@ -169,21 +210,36 @@ async function downloadRealm () {
     () => api.getRealmWorldDownload(String(realm.id), slotId, 'latest')
   )
 
-  const buffer = await withRetry(
+  let buffer = await withRetry(
     'descargar archivo del mundo',
     () => download.getBuffer()
   )
 
+  const bytes = buffer.length
+  const realmHash = crypto.createHash('sha256').update(buffer).digest('hex')
+
   fs.mkdirSync(downloadDir, { recursive: true })
   fs.writeFileSync(mcworldPath, buffer)
-  log(`Realm descargado: ${(buffer.length / 1024 / 1024).toFixed(2)} MB`)
+  log(`Realm descargado: ${(bytes / 1024 / 1024).toFixed(2)} MB | hash: ${realmHash.slice(0, 12)}`)
+
+  buffer = null
+  compactMemory()
+
+  const mapExists = fs.existsSync(path.join(mapDir, 'index.html'))
+  if (!force && mapExists && state.lastRealmHash === realmHash) {
+    fs.rmSync(mcworldPath, { force: true })
+    log('El Realm descargado es identico al ultimo mapa. Se omite extraccion y renderizado.')
+    return { changed: false, hash: realmHash, realmName: realm.name, activeSlot: slotId }
+  }
 
   const nextWorldDir = path.join(workDir, 'world-next')
   fs.rmSync(nextWorldDir, { recursive: true, force: true })
   fs.mkdirSync(nextWorldDir, { recursive: true })
 
-  const zip = new AdmZip(buffer)
+  const zip = new AdmZip(mcworldPath)
   zip.extractAllTo(nextWorldDir, true)
+  fs.rmSync(mcworldPath, { force: true })
+  compactMemory()
 
   if (!fs.existsSync(path.join(nextWorldDir, 'level.dat')) ||
       !fs.existsSync(path.join(nextWorldDir, 'db'))) {
@@ -192,20 +248,25 @@ async function downloadRealm () {
 
   fs.rmSync(worldDir, { recursive: true, force: true })
   fs.renameSync(nextWorldDir, worldDir)
+
+  return { changed: true, hash: realmHash, realmName: realm.name, activeSlot: slotId }
 }
 
 function runProcess (command, args) {
   return new Promise((resolve, reject) => {
+    compactMemory()
+
     const childEnv = {
       ...process.env,
-      // Render Free tiene 512 MB. Limitamos el heap administrado de uNmINeD
-      // a 256 MiB y dejamos memoria para Node, librerias nativas y el SO.
-      DOTNET_GCHeapHardLimit: unminedHeapLimit
+      // 0x10000000 = 256 MiB. Dejamos margen para Node, librerias nativas y SO.
+      DOTNET_GCHeapHardLimit: unminedHeapLimit,
+      DOTNET_GCConserveMemory: '9',
+      COMPlus_gcServer: '0'
     }
 
     const useNice = process.platform === 'linux'
     const executable = useNice ? 'nice' : command
-    const finalArgs = useNice ? ['-n', '10', command, ...args] : args
+    const finalArgs = useNice ? ['-n', '15', command, ...args] : args
 
     const child = spawn(executable, finalArgs, {
       stdio: ['ignore', 'inherit', 'inherit'],
@@ -214,10 +275,37 @@ function runProcess (command, args) {
 
     child.on('error', reject)
     child.on('exit', (code, signal) => {
+      compactMemory()
       if (code === 0) return resolve()
       reject(new Error(`${command} termino con codigo ${code} / señal ${signal || 'ninguna'}`))
     })
   })
+}
+
+function injectServiceWorkerRegistration () {
+  const index = path.join(mapDir, 'index.html')
+  if (!fs.existsSync(index)) return
+
+  let html = fs.readFileSync(index, 'utf8')
+  if (html.includes('/sw.js')) return
+
+  const registration = `
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}
+</script>
+`
+
+  if (html.includes('</body>')) {
+    html = html.replace('</body>', registration + '</body>')
+  } else {
+    html += registration
+  }
+
+  fs.writeFileSync(index, html)
 }
 
 async function renderMap () {
@@ -241,7 +329,7 @@ async function renderMap () {
     `--zoomout=${zoomOut}`
   ]
 
-  log(`Generando mapa: zoom-in ${zoomIn}, zoom-out ${zoomOut}, chunkprocessors ${chunkProcessors}, heap GC max ${unminedHeapLimit}`)
+  log(`Generando mapa: zoom-in ${zoomIn}, zoom-out ${zoomOut}, chunkprocessors ${chunkProcessors}`)
   await runProcess(unminedCli, args)
 
   const unminedIndex = path.join(mapDir, 'unmined.index.html')
@@ -262,31 +350,52 @@ async function renderMap () {
     }
   }
 
+  injectServiceWorkerRegistration()
   state.ready = true
 }
 
-async function updateMap () {
+async function updateMap ({ force = false } = {}) {
   if (state.running) {
     log('Se omite la actualizacion porque la anterior aun esta ejecutandose.')
-    return
+    return false
   }
 
   state.running = true
   state.lastStartedAt = new Date().toISOString()
   state.lastError = null
+  state.lastAction = force ? 'actualizacion manual forzada' : 'actualizacion programada'
 
   try {
-    log('=== Iniciando actualizacion del mapa ===')
-    await downloadRealm()
-    await renderMap()
+    log(`=== Iniciando ${state.lastAction} ===`)
+    const result = await downloadRealm({ force })
+
+    if (result.changed) {
+      await renderMap()
+      state.lastAction = 'mapa regenerado'
+    } else {
+      state.lastAction = 'sin cambios; render omitido'
+    }
+
+    state.lastRealmHash = result.hash
     state.lastSuccessAt = new Date().toISOString()
-    log('=== Mapa actualizado correctamente ===')
+
+    saveMetadata({
+      realmName: state.realmName,
+      activeSlot: state.activeSlot,
+      lastRealmHash: state.lastRealmHash,
+      lastSuccessAt: state.lastSuccessAt
+    })
+
+    log(`=== Actualizacion correcta: ${state.lastAction} ===`)
+    return true
   } catch (error) {
     state.lastError = error.stack || error.message || String(error)
     log('ERROR actualizando mapa:', error)
+    return false
   } finally {
     state.lastFinishedAt = new Date().toISOString()
     state.running = false
+    compactMemory()
   }
 }
 
@@ -317,42 +426,153 @@ ${state.running ? 'Actualizando el Realm ahora mismo…' : state.ready ? 'Mapa l
 <p>Actualizacion: cada <strong>${updateMinutes} minutos</strong>. Zoom: +${zoomIn} / -${zoomOut}.</p>
 <p class="muted">Ultima actualizacion correcta: ${state.lastSuccessAt || 'todavia ninguna'}</p>
 ${safeError ? `<h2 class="bad">Ultimo error</h2><pre>${safeError}</pre>` : ''}
-<p class="muted">Si los logs de Render muestran un codigo de Microsoft, abre microsoft.com/link y autorizalo con la cuenta que tiene acceso al Realm.</p>
 <script>setTimeout(()=>location.reload(),15000)</script>
 </main></body></html>`
 }
 
+app.disable('x-powered-by')
+
 app.get('/health', (_req, res) => {
+  res.set('Cache-Control', 'no-store')
   res.status(200).json({ ok: true, ready: state.ready, running: state.running })
 })
 
-// Endpoint ultraligero para UptimeRobot/monitor externo.
-// NO descarga el Realm ni vuelve a renderizar el mapa.
+// Keepalive: solo responde estado. Nunca descarga el Realm ni ejecuta uNmINeD.
 app.get('/ping', (_req, res) => {
-  const memory = process.memoryUsage()
+  res.set('Cache-Control', 'no-store')
   res.status(200).json({
     ok: true,
     service: 'ocayork-map',
     ready: state.ready,
     runningUpdate: state.running,
     uptimeSeconds: Math.round(process.uptime()),
-    nodeRssMb: Math.round(memory.rss / 1024 / 1024),
-    lastSuccessAt: state.lastSuccessAt
+    memory: memorySnapshot(),
+    lastSuccessAt: state.lastSuccessAt,
+    lastAction: state.lastAction
   })
 })
 
 app.get('/status', (_req, res) => {
-  res.json(state)
+  res.set('Cache-Control', 'no-store')
+  res.json({ ...state, memory: memorySnapshot() })
 })
 
-app.get('/refresh', (_req, res) => {
-  updateMap()
-  res.status(202).json({ accepted: true, running: true })
+// Actualizacion pesada protegida para evitar que terceros consuman CPU/RAM.
+app.all('/refresh', (req, res) => {
+  if (!refreshToken) {
+    return res.status(403).json({
+      ok: false,
+      error: 'REFRESH_TOKEN no esta configurado. /refresh esta deshabilitado.'
+    })
+  }
+
+  const provided = String(req.get('x-refresh-token') || req.query.token || '')
+  if (provided !== refreshToken) {
+    return res.status(401).json({ ok: false, error: 'Token incorrecto.' })
+  }
+
+  if (state.running) {
+    return res.status(409).json({ ok: false, error: 'Ya hay una actualizacion ejecutandose.' })
+  }
+
+  const force = String(req.query.force || '') === '1'
+  updateMap({ force })
+  res.status(202).json({ ok: true, accepted: true, force })
 })
 
-app.use(express.static(mapDir, { index: 'index.html', fallthrough: true, maxAge: '10m', etag: true }))
+// Service Worker con cache limitada: evita recargar JS/CSS/tiles vistos,
+// pero revalida tiles para no quedarse con un mapa viejo.
+app.get('/sw.js', (_req, res) => {
+  res.set('Content-Type', 'application/javascript; charset=utf-8')
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate')
+  res.send(`
+const CACHE = 'ocayork-map-v2';
+const MAX_TILE_ENTRIES = 350;
+
+async function trimCache(cache) {
+  const keys = await cache.keys();
+  if (keys.length <= MAX_TILE_ENTRIES) return;
+  const extra = keys.length - MAX_TILE_ENTRIES;
+  await Promise.all(keys.slice(0, extra).map(key => cache.delete(key)));
+}
+
+self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
+self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
+
+self.addEventListener('fetch', event => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+
+  const url = new URL(req.url);
+  if (url.origin !== location.origin) return;
+
+  const path = url.pathname.toLowerCase();
+  const isTile = path.endsWith('.webp') || path.includes('/tiles/');
+  const isAsset = /\\.(js|css|png|jpg|jpeg|svg|woff2?)$/.test(path);
+
+  if (isTile) {
+    event.respondWith((async () => {
+      const cache = await caches.open(CACHE);
+      const cached = await cache.match(req);
+      const network = fetch(req).then(async response => {
+        if (response.ok) {
+          await cache.put(req, response.clone());
+          trimCache(cache);
+        }
+        return response;
+      }).catch(() => cached);
+
+      return cached || network;
+    })());
+    return;
+  }
+
+  if (isAsset) {
+    event.respondWith((async () => {
+      const cache = await caches.open(CACHE);
+      const cached = await cache.match(req);
+      if (cached) return cached;
+      const response = await fetch(req);
+      if (response.ok) await cache.put(req, response.clone());
+      return response;
+    })());
+  }
+});
+`)
+})
+
+app.use(express.static(mapDir, {
+  index: 'index.html',
+  fallthrough: true,
+  etag: true,
+  lastModified: true,
+  setHeaders: (res, filePath) => {
+    const ext = path.extname(filePath).toLowerCase()
+
+    if (ext === '.html') {
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate')
+      return
+    }
+
+    if (ext === '.webp' || filePath.includes(`${path.sep}tiles${path.sep}`)) {
+      res.setHeader(
+        'Cache-Control',
+        `public, max-age=${tileCacheSeconds}, stale-while-revalidate=86400`
+      )
+      return
+    }
+
+    if (['.js', '.css', '.png', '.jpg', '.jpeg', '.svg', '.woff', '.woff2'].includes(ext)) {
+      res.setHeader(
+        'Cache-Control',
+        `public, max-age=${assetCacheSeconds}, stale-while-revalidate=86400`
+      )
+    }
+  }
+}))
 
 app.get('*', (_req, res) => {
+  res.set('Cache-Control', 'no-cache, must-revalidate')
   if (fs.existsSync(path.join(mapDir, 'index.html'))) {
     return res.sendFile(path.join(mapDir, 'index.html'))
   }
@@ -367,8 +587,9 @@ app.listen(port, '0.0.0.0', () => {
   log(`Realm ID: ${realmId}`)
   log(`Actualizacion del mapa cada ${updateMinutes} minutos`)
   log(`Zoom-in: ${zoomIn}; zoom-out: ${zoomOut}; chunkprocessors: ${chunkProcessors}`)
-  log(`Keepalive liviano disponible en /ping`)
+  log(`Cache: tiles ${tileCacheSeconds}s, assets ${assetCacheSeconds}s, SW max 350 tiles`)
+  log('Keepalive liviano disponible en /ping')
 
-  setTimeout(updateMap, 1000)
-  setInterval(updateMap, updateMinutes * 60 * 1000)
+  setTimeout(() => updateMap(), 1000)
+  setInterval(() => updateMap(), updateMinutes * 60 * 1000)
 })
