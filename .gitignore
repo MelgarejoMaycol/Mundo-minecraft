@@ -1,0 +1,11 @@
+# Automatización del mapa del Realm
+automation/node_modules/
+automation/.auth-cache/
+automation/config.json
+automation/work/
+automation/logs/
+*.mcworld
+
+# Vercel local
+.vercel/
+**/.vercel/
