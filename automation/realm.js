@@ -68,7 +68,8 @@ function readConfig () {
     )
   }
 
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+  const rawConfig = fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '')
+  const config = JSON.parse(rawConfig)
 
   if (!config.realmId) {
     throw new Error('config.json no tiene realmId.')
