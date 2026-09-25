@@ -12,10 +12,14 @@ services:
       - key: REALM_ID
         value: "33911323"
       - key: UPDATE_INTERVAL_MINUTES
-        value: "15"
+        value: "60"
       - key: ZOOM_IN
         value: "3"
       - key: ZOOM_OUT
         value: "8"
+      - key: UNMINED_CHUNK_PROCESSORS
+        value: "1"
+      - key: UNMINED_GC_HEAP_LIMIT
+        value: "10000000"
       - key: AUTH_CACHE_ZIP_BASE64
         sync: false
