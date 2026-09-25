@@ -70,7 +70,9 @@ $config = [ordered]@{
     preserveCustomMarkers = $true
 }
 
-$config | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
+$configJson = $config | ConvertTo-Json
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($configPath, $configJson, $utf8NoBom)
 
 Write-Host ""
 Write-Host "Configuracion guardada."
