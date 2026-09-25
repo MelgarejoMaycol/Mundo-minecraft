@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: ocayork-map
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: cd render && npm install && bash install-unmined.sh
+    startCommand: cd render && npm start
+    healthCheckPath: /health
+    envVars:
+      - key: REALM_ID
+        value: "33911323"
+      - key: UPDATE_INTERVAL_MINUTES
+        value: "15"
+      - key: ZOOM_IN
+        value: "3"
+      - key: ZOOM_OUT
+        value: "8"
+      - key: AUTH_CACHE_ZIP_BASE64
+        sync: false
