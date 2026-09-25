@@ -21,7 +21,7 @@ const unminedCli = process.env.UNMINED_CLI || path.join(renderDir, '.unmined', '
 
 const realmId = String(process.env.REALM_ID || '33911323')
 const updateMinutes = Math.max(60, Number(process.env.UPDATE_INTERVAL_MINUTES || 60))
-const zoomIn = Math.max(0, Number(process.env.ZOOM_IN || 3))
+const zoomIn = Math.max(0, Number(process.env.ZOOM_IN || 2))
 const zoomOut = Math.max(0, Number(process.env.ZOOM_OUT || 10))
 const clientExtraZoom = Math.max(0, Math.min(6, Number(process.env.CLIENT_EXTRA_ZOOM || 4)))
 const chunkProcessors = Math.max(1, Number(process.env.UNMINED_CHUNK_PROCESSORS || 1))
