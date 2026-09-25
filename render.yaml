@@ -4,6 +4,7 @@ services:
     runtime: node
     plan: free
     region: oregon
+    autoDeployTrigger: off
     buildCommand: cd render && npm install && bash install-unmined.sh
     startCommand: cd render && npm start
     healthCheckPath: /health
