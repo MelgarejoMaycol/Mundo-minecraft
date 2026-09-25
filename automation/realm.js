@@ -36,8 +36,62 @@ function createApi () {
   return RealmAPI.from(authflow, 'bedrock')
 }
 
+
+function sleep (ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function isTransientNetworkError (error) {
+  const text = String(
+    (error && (error.code || error.message || error.statusCode || error.status)) || error || ''
+  ).toUpperCase()
+
+  return [
+    'ETIMEDOUT',
+    'ESOCKETTIMEDOUT',
+    'ECONNRESET',
+    'ECONNREFUSED',
+    'EAI_AGAIN',
+    'ENETUNREACH',
+    'EHOSTUNREACH',
+    '429',
+    '500',
+    '502',
+    '503',
+    '504'
+  ].some(code => text.includes(code))
+}
+
+async function withRetry (label, operation, attempts = 5) {
+  let lastError
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      if (attempt > 1) {
+        console.log(`Reintento ${attempt}/${attempts}: ${label}...`)
+      }
+      return await operation()
+    } catch (error) {
+      lastError = error
+
+      if (!isTransientNetworkError(error) || attempt === attempts) {
+        throw error
+      }
+
+      const waitMs = Math.min(3000 * (2 ** (attempt - 1)), 24000)
+      console.warn(
+        `Fallo temporal de red en "${label}": ${error.message || error}`
+      )
+      console.warn(`Esperando ${Math.round(waitMs / 1000)} segundos antes de reintentar...`)
+      await sleep(waitMs)
+    }
+  }
+
+  throw lastError
+}
+
 async function getRealms (api) {
-  const realms = await api.getRealms()
+  const realms = await withRetry('consultar Realms', () => api.getRealms())
   return Array.isArray(realms) ? realms : []
 }
 
@@ -97,13 +151,19 @@ async function downloadRealm () {
   console.log('Slot activo:', slotId)
   console.log('Solicitando la copia más reciente al Realm...')
 
-  const download = await api.getRealmWorldDownload(
-    String(realm.id),
-    slotId,
-    'latest'
+  const download = await withRetry(
+    'solicitar enlace de descarga del Realm',
+    () => api.getRealmWorldDownload(
+      String(realm.id),
+      slotId,
+      'latest'
+    )
   )
 
-  const buffer = await download.getBuffer()
+  const buffer = await withRetry(
+    'descargar archivo del mundo',
+    () => download.getBuffer()
+  )
 
   fs.mkdirSync(downloadDir, { recursive: true })
   fs.writeFileSync(mcworldPath, buffer)
