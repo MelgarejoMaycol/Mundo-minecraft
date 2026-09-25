@@ -22,7 +22,8 @@ const unminedCli = process.env.UNMINED_CLI || path.join(renderDir, '.unmined', '
 const realmId = String(process.env.REALM_ID || '33911323')
 const updateMinutes = Math.max(60, Number(process.env.UPDATE_INTERVAL_MINUTES || 60))
 const zoomIn = Math.max(0, Number(process.env.ZOOM_IN || 3))
-const zoomOut = Math.max(0, Number(process.env.ZOOM_OUT || 8))
+const zoomOut = Math.max(0, Number(process.env.ZOOM_OUT || 10))
+const clientExtraZoom = Math.max(0, Math.min(6, Number(process.env.CLIENT_EXTRA_ZOOM || 4)))
 const chunkProcessors = Math.max(1, Number(process.env.UNMINED_CHUNK_PROCESSORS || 1))
 const unminedHeapLimit = process.env.UNMINED_GC_HEAP_LIMIT || '10000000'
 const tileCacheSeconds = Math.max(60, Number(process.env.TILE_CACHE_SECONDS || 600))
@@ -62,6 +63,7 @@ const state = {
   updateMinutes,
   zoomIn,
   zoomOut,
+  clientExtraZoom,
   chunkProcessors
 }
 
@@ -308,6 +310,107 @@ if ('serviceWorker' in navigator) {
   fs.writeFileSync(index, html)
 }
 
+function applyClientRendererEnhancements () {
+  const propertiesPath = path.join(mapDir, 'unmined.map.properties.js')
+  const viewerPath = path.join(mapDir, 'unmined.js')
+
+  if (fs.existsSync(propertiesPath)) {
+    let properties = fs.readFileSync(propertiesPath, 'utf8')
+
+    if (/clientExtraZoom:\s*\d+/.test(properties)) {
+      properties = properties.replace(
+        /clientExtraZoom:\s*\d+/,
+        `clientExtraZoom: ${clientExtraZoom}`
+      )
+    } else {
+      properties = properties.replace(
+        'var UnminedMapProperties = {',
+        `var UnminedMapProperties = {\n    clientExtraZoom: ${clientExtraZoom},`
+      )
+    }
+
+    fs.writeFileSync(propertiesPath, properties)
+  }
+
+  if (!fs.existsSync(viewerPath)) return
+
+  let viewer = fs.readFileSync(viewerPath, 'utf8')
+
+  if (!viewer.includes('/* OCAYORK_CLIENT_OVERZOOM */')) {
+    viewer = viewer.replace(
+      'const dpiScale = window.devicePixelRatio ?? 1.0;',
+      `const dpiScale = window.devicePixelRatio ?? 1.0;
+        /* OCAYORK_CLIENT_OVERZOOM */
+        const clientExtraZoom = Math.max(0, this.#options.clientExtraZoom ?? 0);
+        const deviceMemory = navigator.deviceMemory ?? 4;
+        const clientTileCacheSize = deviceMemory >= 8 ? 768 : (deviceMemory >= 4 ? 384 : 192);
+        const clientPreload = deviceMemory >= 4 ? 1 : 0;`
+    )
+
+    viewer = viewer.replace(
+      'var tileGrid = new ol.tilegrid.TileGrid({',
+      `const viewResolutions = resolutions.slice();
+        if (clientExtraZoom > 0 && resolutions.length > 0) {
+            const finestResolution = resolutions[resolutions.length - 1];
+            for (let i = 1; i <= clientExtraZoom; i++) {
+                viewResolutions.push(finestResolution / Math.pow(2, i));
+            }
+        }
+
+        var tileGrid = new ol.tilegrid.TileGrid({`
+    )
+
+    viewer = viewer.replace(
+      'new ol.layer.Tile({\n                source:',
+      `new ol.layer.Tile({
+                cacheSize: clientTileCacheSize,
+                preload: clientPreload,
+                source:`
+    )
+
+    viewer = viewer.replace(
+      'tilePixelRatio: dpiScale,\n                    tileSize:',
+      `tilePixelRatio: dpiScale,
+                    interpolate: false,
+                    tileSize:`
+    )
+
+    viewer = viewer.replace(
+      'resolutions: tileGrid.getResolutions(),\n                maxZoom: mapZoomLevels,',
+      `resolutions: viewResolutions,
+                maxZoom: mapZoomLevels + clientExtraZoom,`
+    )
+
+    viewer = viewer.replace(
+      'constrainResolution: true,',
+      'constrainResolution: false,'
+    )
+
+    fs.writeFileSync(viewerPath, viewer)
+  }
+
+  const cssPath = path.join(mapDir, 'index.css')
+  if (fs.existsSync(cssPath)) {
+    let css = fs.readFileSync(cssPath, 'utf8')
+    if (!css.includes('OCAYORK_CLIENT_RENDERING')) {
+      css += `
+
+/* OCAYORK_CLIENT_RENDERING
+   El navegador hace el overzoom y usa aceleracion grafica/canvas local.
+   No se generan tiles adicionales en Render para estos niveles extra. */
+#map { touch-action: none; }
+.ol-viewport, .ol-layer canvas {
+  backface-visibility: hidden;
+  transform: translateZ(0);
+}
+`
+      fs.writeFileSync(cssPath, css)
+    }
+  }
+
+  log(`Render cliente habilitado: +${clientExtraZoom} niveles de overzoom sin tiles extra del servidor.`)
+}
+
 async function renderMap () {
   if (!fs.existsSync(unminedCli)) {
     throw new Error(`No se encontro uNmINeD CLI en ${unminedCli}`)
@@ -322,7 +425,7 @@ async function renderMap () {
     `--output=${mapDir}`,
     '--imageformat=webp',
     '--webp-format=lossy',
-    '--webp-quality=82',
+    '--webp-quality=90',
     '--webp-method=3',
     `--chunkprocessors=${chunkProcessors}`,
     `--zoomin=${zoomIn}`,
@@ -350,6 +453,7 @@ async function renderMap () {
     }
   }
 
+  applyClientRendererEnhancements()
   injectServiceWorkerRegistration()
   state.ready = true
 }
@@ -586,7 +690,7 @@ app.listen(port, '0.0.0.0', () => {
   log(`Servidor web escuchando en puerto ${port}`)
   log(`Realm ID: ${realmId}`)
   log(`Actualizacion del mapa cada ${updateMinutes} minutos`)
-  log(`Zoom-in: ${zoomIn}; zoom-out: ${zoomOut}; chunkprocessors: ${chunkProcessors}`)
+  log(`Zoom real servidor: +${zoomIn}/-${zoomOut}; overzoom cliente adicional: +${clientExtraZoom}; chunkprocessors: ${chunkProcessors}`)
   log(`Cache: tiles ${tileCacheSeconds}s, assets ${assetCacheSeconds}s, SW max 350 tiles`)
   log('Keepalive liviano disponible en /ping')
 
