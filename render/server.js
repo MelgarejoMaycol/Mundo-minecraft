@@ -18,9 +18,11 @@ const mcworldPath = path.join(downloadDir, 'realm.mcworld')
 const unminedCli = process.env.UNMINED_CLI || path.join(renderDir, '.unmined', 'unmined-cli')
 
 const realmId = String(process.env.REALM_ID || '33911323')
-const updateMinutes = Math.max(5, Number(process.env.UPDATE_INTERVAL_MINUTES || 15))
+const updateMinutes = Math.max(60, Number(process.env.UPDATE_INTERVAL_MINUTES || 60))
 const zoomIn = Math.max(0, Number(process.env.ZOOM_IN || 3))
 const zoomOut = Math.max(0, Number(process.env.ZOOM_OUT || 8))
+const chunkProcessors = Math.max(1, Number(process.env.UNMINED_CHUNK_PROCESSORS || 1))
+const unminedHeapLimit = process.env.UNMINED_GC_HEAP_LIMIT || '10000000'
 const port = Number(process.env.PORT || 10000)
 
 const app = express()
@@ -37,7 +39,8 @@ const state = {
   lastError: null,
   updateMinutes,
   zoomIn,
-  zoomOut
+  zoomOut,
+  chunkProcessors
 }
 
 function log (...args) {
@@ -193,9 +196,20 @@ async function downloadRealm () {
 
 function runProcess (command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const childEnv = {
+      ...process.env,
+      // Render Free tiene 512 MB. Limitamos el heap administrado de uNmINeD
+      // a 256 MiB y dejamos memoria para Node, librerias nativas y el SO.
+      DOTNET_GCHeapHardLimit: unminedHeapLimit
+    }
+
+    const useNice = process.platform === 'linux'
+    const executable = useNice ? 'nice' : command
+    const finalArgs = useNice ? ['-n', '10', command, ...args] : args
+
+    const child = spawn(executable, finalArgs, {
       stdio: ['ignore', 'inherit', 'inherit'],
-      env: process.env
+      env: childEnv
     })
 
     child.on('error', reject)
@@ -219,11 +233,15 @@ async function renderMap () {
     `--world=${worldDir}`,
     `--output=${mapDir}`,
     '--imageformat=webp',
+    '--webp-format=lossy',
+    '--webp-quality=82',
+    '--webp-method=3',
+    `--chunkprocessors=${chunkProcessors}`,
     `--zoomin=${zoomIn}`,
     `--zoomout=${zoomOut}`
   ]
 
-  log(`Generando mapa: zoom-in ${zoomIn}, zoom-out ${zoomOut}`)
+  log(`Generando mapa: zoom-in ${zoomIn}, zoom-out ${zoomOut}, chunkprocessors ${chunkProcessors}, heap GC max ${unminedHeapLimit}`)
   await runProcess(unminedCli, args)
 
   const unminedIndex = path.join(mapDir, 'unmined.index.html')
@@ -308,6 +326,21 @@ app.get('/health', (_req, res) => {
   res.status(200).json({ ok: true, ready: state.ready, running: state.running })
 })
 
+// Endpoint ultraligero para UptimeRobot/monitor externo.
+// NO descarga el Realm ni vuelve a renderizar el mapa.
+app.get('/ping', (_req, res) => {
+  const memory = process.memoryUsage()
+  res.status(200).json({
+    ok: true,
+    service: 'ocayork-map',
+    ready: state.ready,
+    runningUpdate: state.running,
+    uptimeSeconds: Math.round(process.uptime()),
+    nodeRssMb: Math.round(memory.rss / 1024 / 1024),
+    lastSuccessAt: state.lastSuccessAt
+  })
+})
+
 app.get('/status', (_req, res) => {
   res.json(state)
 })
@@ -317,7 +350,7 @@ app.get('/refresh', (_req, res) => {
   res.status(202).json({ accepted: true, running: true })
 })
 
-app.use(express.static(mapDir, { index: 'index.html', fallthrough: true }))
+app.use(express.static(mapDir, { index: 'index.html', fallthrough: true, maxAge: '10m', etag: true }))
 
 app.get('*', (_req, res) => {
   if (fs.existsSync(path.join(mapDir, 'index.html'))) {
@@ -332,8 +365,9 @@ restoreAuthCacheFromEnv()
 app.listen(port, '0.0.0.0', () => {
   log(`Servidor web escuchando en puerto ${port}`)
   log(`Realm ID: ${realmId}`)
-  log(`Actualizacion cada ${updateMinutes} minutos`)
-  log(`Zoom-in: ${zoomIn}; zoom-out: ${zoomOut}`)
+  log(`Actualizacion del mapa cada ${updateMinutes} minutos`)
+  log(`Zoom-in: ${zoomIn}; zoom-out: ${zoomOut}; chunkprocessors: ${chunkProcessors}`)
+  log(`Keepalive liviano disponible en /ping`)
 
   setTimeout(updateMap, 1000)
   setInterval(updateMap, updateMinutes * 60 * 1000)
