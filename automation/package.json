@@ -1,0 +1,16 @@
+{
+  "name": "minecraft-realm-map-automation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Descarga automática de un Minecraft Bedrock Realm y generación del mapa web con uNmINeD.",
+  "type": "commonjs",
+  "scripts": {
+    "realms": "node realm.js list",
+    "download": "node realm.js download"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "prismarine-auth": "3.1.1",
+    "prismarine-realms": "1.6.0"
+  }
+}
