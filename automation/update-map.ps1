@@ -98,7 +98,7 @@ try {
         Write-Host ""
         Write-Host "Mapa generado. Se omitió el despliegue a Vercel."
         Write-Host "Carpeta:" $renderDir
-        exit 0
+        return
     }
 
     Write-Host ""
