@@ -343,8 +343,8 @@ function applyClientRendererEnhancements () {
         /* OCAYORK_CLIENT_OVERZOOM */
         const clientExtraZoom = Math.max(0, this.#options.clientExtraZoom ?? 0);
         const deviceMemory = navigator.deviceMemory ?? 4;
-        const clientTileCacheSize = deviceMemory >= 8 ? 768 : (deviceMemory >= 4 ? 384 : 192);
-        const clientPreload = deviceMemory >= 4 ? 1 : 0;`
+        const clientTileCacheSize = deviceMemory >= 8 ? 1536 : (deviceMemory >= 4 ? 896 : 384);
+        const clientPreload = deviceMemory >= 8 ? 3 : (deviceMemory >= 4 ? 2 : 1);`
     )
 
     viewer = viewer.replace(
@@ -363,8 +363,10 @@ function applyClientRendererEnhancements () {
     viewer = viewer.replace(
       'new ol.layer.Tile({\n                source:',
       `new ol.layer.Tile({
-                cacheSize: clientTileCacheSize,
                 preload: clientPreload,
+                useInterimTilesOnError: true,
+                updateWhileAnimating: true,
+                updateWhileInteracting: true,
                 source:`
     )
 
@@ -399,9 +401,8 @@ function applyClientRendererEnhancements () {
    El navegador hace el overzoom y usa aceleracion grafica/canvas local.
    No se generan tiles adicionales en Render para estos niveles extra. */
 #map { touch-action: none; }
-.ol-viewport, .ol-layer canvas {
+.ol-viewport {
   backface-visibility: hidden;
-  transform: translateZ(0);
 }
 `
       fs.writeFileSync(cssPath, css)
@@ -590,8 +591,8 @@ app.get('/sw.js', (_req, res) => {
   res.set('Content-Type', 'application/javascript; charset=utf-8')
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate')
   res.send(`
-const CACHE = 'ocayork-map-v2';
-const MAX_TILE_ENTRIES = 350;
+const CACHE = 'ocayork-map-v3';
+const MAX_TILE_ENTRIES = 1200;
 
 async function trimCache(cache) {
   const keys = await cache.keys();
@@ -601,7 +602,15 @@ async function trimCache(cache) {
 }
 
 self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
-self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
+self.addEventListener('activate', event => event.waitUntil((async () => {
+  const names = await caches.keys();
+  await Promise.all(
+    names
+      .filter(name => name.startsWith('ocayork-map-') && name !== CACHE)
+      .map(name => caches.delete(name))
+  );
+  await self.clients.claim();
+})()));
 
 self.addEventListener('fetch', event => {
   const req = event.request;
@@ -619,7 +628,8 @@ self.addEventListener('fetch', event => {
       const cache = await caches.open(CACHE);
       const cached = await cache.match(req);
       const network = fetch(req).then(async response => {
-        if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (response.ok && contentType.startsWith('image/')) {
           await cache.put(req, response.clone());
           trimCache(cache);
         }
@@ -675,6 +685,14 @@ app.use(express.static(mapDir, {
   }
 }))
 
+// MISSING_MAP_ASSET_404
+// Nunca devolver index.html para una URL de tile faltante: el navegador podria
+// cachear HTML como si fuera una imagen y dejar cuadros blancos persistentes.
+app.get(/\.(?:webp|png|jpe?g|gif|svg)$/i, (_req, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.status(404).end()
+})
+
 app.get('*', (_req, res) => {
   res.set('Cache-Control', 'no-cache, must-revalidate')
   if (fs.existsSync(path.join(mapDir, 'index.html'))) {
@@ -691,7 +709,7 @@ app.listen(port, '0.0.0.0', () => {
   log(`Realm ID: ${realmId}`)
   log(`Actualizacion del mapa cada ${updateMinutes} minutos`)
   log(`Zoom real servidor: +${zoomIn}/-${zoomOut}; overzoom cliente adicional: +${clientExtraZoom}; chunkprocessors: ${chunkProcessors}`)
-  log(`Cache: tiles ${tileCacheSeconds}s, assets ${assetCacheSeconds}s, SW max 350 tiles`)
+  log(`Cache: tiles ${tileCacheSeconds}s, assets ${assetCacheSeconds}s, SW max 1200 tiles`)
   log('Keepalive liviano disponible en /ping')
 
   setTimeout(() => updateMap(), 1000)
