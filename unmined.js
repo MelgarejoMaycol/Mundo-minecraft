@@ -206,6 +206,10 @@ class Unmined {
         this.regionMap = new RegionMap(regions, worldTileSize, worldMinX, worldMinZ, worldWidth, worldHeight);
 
         const dpiScale = window.devicePixelRatio ?? 1.0;
+        /* OCAYORK_PERSISTENT_TILE_CACHE */
+        const deviceMemory = navigator.deviceMemory ?? 4;
+        const clientTileCacheSize = deviceMemory >= 8 ? 2048 : (deviceMemory >= 4 ? 1024 : 512);
+        const clientPreload = deviceMemory >= 8 ? 3 : (deviceMemory >= 4 ? 2 : 1);
 
         this.#initProjections(
             Math.max(
@@ -241,10 +245,16 @@ class Unmined {
 
         var unminedLayer =
             new ol.layer.Tile({
+                preload: clientPreload,
+                useInterimTilesOnError: true,
+                updateWhileAnimating: true,
+                updateWhileInteracting: true,
                 source: new ol.source.XYZ({
+                    cacheSize: clientTileCacheSize,
                     projection: this.viewProjection,
                     tileGrid: tileGrid,
                     tilePixelRatio: dpiScale,
+                    interpolate: false,
                     tileSize: worldTileSize / dpiScale,
 
                     tileUrlFunction: (coordinate) => {
