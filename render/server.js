@@ -343,7 +343,7 @@ function applyClientRendererEnhancements () {
         /* OCAYORK_CLIENT_OVERZOOM */
         const clientExtraZoom = Math.max(0, this.#options.clientExtraZoom ?? 0);
         const deviceMemory = navigator.deviceMemory ?? 4;
-        const clientTileCacheSize = deviceMemory >= 8 ? 1536 : (deviceMemory >= 4 ? 896 : 384);
+        const clientTileCacheSize = deviceMemory >= 8 ? 2048 : (deviceMemory >= 4 ? 1024 : 512);
         const clientPreload = deviceMemory >= 8 ? 3 : (deviceMemory >= 4 ? 2 : 1);`
     )
 
@@ -388,6 +388,16 @@ function applyClientRendererEnhancements () {
       'constrainResolution: false,'
     )
 
+    fs.writeFileSync(viewerPath, viewer)
+  }
+
+  if (!viewer.includes('/* OCAYORK_PERSISTENT_TILE_CACHE */')) {
+    viewer = viewer.replace(
+      'source: new ol.source.XYZ({',
+      `source: new ol.source.XYZ({
+                    /* OCAYORK_PERSISTENT_TILE_CACHE */
+                    cacheSize: clientTileCacheSize,`
+    )
     fs.writeFileSync(viewerPath, viewer)
   }
 
@@ -478,7 +488,9 @@ async function updateMap ({ force = false } = {}) {
       await renderMap()
       state.lastAction = 'mapa regenerado'
     } else {
-      state.lastAction = 'sin cambios; render omitido'
+      applyClientRendererEnhancements()
+      injectServiceWorkerRegistration()
+      state.lastAction = 'sin cambios; render omitido; caché cliente verificada'
     }
 
     state.lastRealmHash = result.hash
@@ -585,74 +597,12 @@ app.all('/refresh', (req, res) => {
   res.status(202).json({ ok: true, accepted: true, force })
 })
 
-// Service Worker con cache limitada: evita recargar JS/CSS/tiles vistos,
-// pero revalida tiles para no quedarse con un mapa viejo.
+// Service Worker persistente: conserva todos los tiles visitados.
+// Devuelve inmediatamente el tile cacheado y lo revalida en segundo plano.
 app.get('/sw.js', (_req, res) => {
   res.set('Content-Type', 'application/javascript; charset=utf-8')
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate')
-  res.send(`
-const CACHE = 'ocayork-map-v3';
-const MAX_TILE_ENTRIES = 1200;
-
-async function trimCache(cache) {
-  const keys = await cache.keys();
-  if (keys.length <= MAX_TILE_ENTRIES) return;
-  const extra = keys.length - MAX_TILE_ENTRIES;
-  await Promise.all(keys.slice(0, extra).map(key => cache.delete(key)));
-}
-
-self.addEventListener('install', event => event.waitUntil(self.skipWaiting()));
-self.addEventListener('activate', event => event.waitUntil((async () => {
-  const names = await caches.keys();
-  await Promise.all(
-    names
-      .filter(name => name.startsWith('ocayork-map-') && name !== CACHE)
-      .map(name => caches.delete(name))
-  );
-  await self.clients.claim();
-})()));
-
-self.addEventListener('fetch', event => {
-  const req = event.request;
-  if (req.method !== 'GET') return;
-
-  const url = new URL(req.url);
-  if (url.origin !== location.origin) return;
-
-  const path = url.pathname.toLowerCase();
-  const isTile = path.endsWith('.webp') || path.includes('/tiles/');
-  const isAsset = /\\.(js|css|png|jpg|jpeg|svg|woff2?)$/.test(path);
-
-  if (isTile) {
-    event.respondWith((async () => {
-      const cache = await caches.open(CACHE);
-      const cached = await cache.match(req);
-      const network = fetch(req).then(async response => {
-        const contentType = response.headers.get('content-type') || '';
-        if (response.ok && contentType.startsWith('image/')) {
-          await cache.put(req, response.clone());
-          trimCache(cache);
-        }
-        return response;
-      }).catch(() => cached);
-
-      return cached || network;
-    })());
-    return;
-  }
-
-  if (isAsset) {
-    event.respondWith((async () => {
-      const cache = await caches.open(CACHE);
-      const cached = await cache.match(req);
-      if (cached) return cached;
-      const response = await fetch(req);
-      if (response.ok) await cache.put(req, response.clone());
-      return response;
-    })());
-  }
-});
-`)
+  res.send("/* OCAYORK_PERSISTENT_MAP_CACHE\n   Conserva todos los tiles visitados. No hay poda intencional por cantidad.\n   Los tiles cacheados se muestran al instante y se revalidan en segundo plano. */\nconst CACHE = 'ocayork-map-v4-persistent';\n\nasync function fetchAndCache(cache, request) {\n  const response = await fetch(new Request(request, { cache: 'no-cache' }));\n  const contentType = response.headers.get('content-type') || '';\n  if (response.ok && contentType.startsWith('image/')) {\n    await cache.put(request, response.clone());\n  }\n  return response;\n}\n\nself.addEventListener('install', event => {\n  event.waitUntil(self.skipWaiting());\n});\n\nself.addEventListener('activate', event => {\n  event.waitUntil((async () => {\n    const names = await caches.keys();\n    await Promise.all(\n      names\n        .filter(name => name.startsWith('ocayork-map-') && name !== CACHE)\n        .map(name => caches.delete(name))\n    );\n    await self.clients.claim();\n  })());\n});\n\nself.addEventListener('fetch', event => {\n  const request = event.request;\n  if (request.method !== 'GET') return;\n\n  const url = new URL(request.url);\n  if (url.origin !== self.location.origin) return;\n\n  const path = url.pathname.toLowerCase();\n  const isTile = path.endsWith('.webp') || path.includes('/tiles/');\n  const isAsset = /\\.(js|css|png|jpg|jpeg|svg|woff2?)$/.test(path);\n\n  if (isTile) {\n    const cachePromise = caches.open(CACHE);\n    const cachedPromise = cachePromise.then(cache => cache.match(request));\n\n    const revalidatePromise = Promise.all([cachePromise, cachedPromise])\n      .then(async ([cache, cached]) => {\n        if (!cached) return;\n        try {\n          await fetchAndCache(cache, request);\n        } catch {\n          // El tile cacheado sigue disponible aunque la red falle.\n        }\n      });\n\n    event.waitUntil(revalidatePromise);\n\n    event.respondWith(\n      Promise.all([cachePromise, cachedPromise]).then(async ([cache, cached]) => {\n        if (cached) return cached;\n        return fetchAndCache(cache, request);\n      })\n    );\n    return;\n  }\n\n  if (isAsset) {\n    event.respondWith((async () => {\n      const cache = await caches.open(CACHE);\n      const cached = await cache.match(request);\n      if (cached) return cached;\n\n      const response = await fetch(request);\n      if (response.ok) await cache.put(request, response.clone());\n      return response;\n    })());\n  }\n});\n")
 })
 
 app.use(express.static(mapDir, {
@@ -709,7 +659,7 @@ app.listen(port, '0.0.0.0', () => {
   log(`Realm ID: ${realmId}`)
   log(`Actualizacion del mapa cada ${updateMinutes} minutos`)
   log(`Zoom real servidor: +${zoomIn}/-${zoomOut}; overzoom cliente adicional: +${clientExtraZoom}; chunkprocessors: ${chunkProcessors}`)
-  log(`Cache: tiles ${tileCacheSeconds}s, assets ${assetCacheSeconds}s, SW max 1200 tiles`)
+  log(`Cache: tiles ${tileCacheSeconds}s, assets ${assetCacheSeconds}s, SW persistente sin poda intencional`)
   log('Keepalive liviano disponible en /ping')
 
   setTimeout(() => updateMap(), 1000)
