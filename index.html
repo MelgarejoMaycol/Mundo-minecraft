@@ -56,6 +56,19 @@
 
 
     </script>
+
+<script>
+/* OCAYORK_PERSISTENT_MAP_CACHE */
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+    if (navigator.storage && navigator.storage.persist) {
+      navigator.storage.persist().catch(() => {});
+    }
+  });
+}
+</script>
+
 </body>
 
 </html>
