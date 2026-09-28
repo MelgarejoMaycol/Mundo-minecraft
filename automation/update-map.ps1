@@ -91,6 +91,12 @@ try {
         throw "uNmINeD no generó index.html/unmined.index.html."
     }
 
+    Write-Host "Aplicando caché persistente y precarga del visor..."
+    node (Join-Path $automationDir "enhance-map.js") $renderDir $repoDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "No se pudieron aplicar las mejoras de caché al mapa."
+    }
+
     if ($config.preserveCustomMarkers -ne $false) {
         $customMarkers = Join-Path $repoDir "custom.markers.js"
         $customPin = Join-Path $repoDir "custom.pin.png"
