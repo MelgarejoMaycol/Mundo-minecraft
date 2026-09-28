@@ -1,3 +1,4 @@
+/* Deployment sync marker: persistent-cache-v4 */
 /* OCAYORK_PERSISTENT_MAP_CACHE
    Conserva todos los tiles visitados. No hay poda intencional por cantidad.
    Los tiles cacheados se muestran al instante y se revalidan en segundo plano. */
