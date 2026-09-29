@@ -72,7 +72,7 @@ try {
     Write-Host ""
     Write-Host "2/3 Actualizando el mapa con uNmINeD..."
     Write-Host "Formato de tiles: WebP"
-    & $unminedCli web render "--world=$worldDir" "--output=$renderDir" "--imageformat=webp"
+    & $unminedCli web render "--world=$worldDir" "--output=$renderDir" "--imageformat=webp" "--webp-format=lossy" "--webp-quality=85" "--webp-method=2" "--chunkprocessors=1" "--zoomin=0" "--zoomout=10"
 
     if ($LASTEXITCODE -ne 0) {
         throw "uNmINeD terminó con código $LASTEXITCODE."
