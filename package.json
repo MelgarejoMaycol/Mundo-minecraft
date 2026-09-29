@@ -4,12 +4,14 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node --expose-gc --max-old-space-size=128 render/server.js"
+    "start": "node --expose-gc --max-old-space-size=128 render/server.js",
+    "test": "node --check render/server.js && node --check sw.js && node --check automation/enhance-map.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
     "express": "4.21.2",
     "prismarine-auth": "3.1.1",
-    "prismarine-realms": "1.6.0"
+    "prismarine-realms": "1.6.0",
+    "unzipper": "^0.12.3"
   }
 }
