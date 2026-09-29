@@ -1,11 +1,16 @@
-/* Deployment sync marker: persistent-cache-v4 */
-/* OCAYORK_PERSISTENT_MAP_CACHE
-   Conserva todos los tiles visitados. No hay poda intencional por cantidad.
-   Los tiles cacheados se muestran al instante y se revalidan en segundo plano. */
-const CACHE = 'ocayork-map-v4-persistent';
+/* OCAYORK_PERSISTENT_MAP_CACHE_V5
+   Los tiles y los assets usan caches separados.
+   Los tiles visitados no se borran cuando cambia la version de la app.
+   Un tile cacheado se muestra al instante y se revalida en segundo plano. */
+const TILE_CACHE = 'ocayork-tiles-v1';
+const ASSET_CACHE = 'ocayork-assets-v2';
 
-async function fetchAndCache(cache, request) {
-  const response = await fetch(new Request(request, { cache: 'no-cache' }));
+async function fetchFresh(request) {
+  return fetch(new Request(request, { cache: 'no-cache' }));
+}
+
+async function fetchAndCacheTile(cache, request) {
+  const response = await fetchFresh(request);
   const contentType = response.headers.get('content-type') || '';
   if (response.ok && contentType.startsWith('image/')) {
     await cache.put(request, response.clone());
@@ -20,11 +25,15 @@ self.addEventListener('install', event => {
 self.addEventListener('activate', event => {
   event.waitUntil((async () => {
     const names = await caches.keys();
+
+    // Solo eliminamos caches viejos de assets. Nunca hacemos poda automatica
+    // de caches de tiles, incluidos los de versiones anteriores.
     await Promise.all(
       names
-        .filter(name => name.startsWith('ocayork-map-') && name !== CACHE)
+        .filter(name => name.startsWith('ocayork-assets-') && name !== ASSET_CACHE)
         .map(name => caches.delete(name))
     );
+
     await self.clients.claim();
   })());
 });
@@ -41,33 +50,33 @@ self.addEventListener('fetch', event => {
   const isAsset = /\.(js|css|png|jpg|jpeg|svg|woff2?)$/.test(path);
 
   if (isTile) {
-    const cachePromise = caches.open(CACHE);
-    const cachedPromise = cachePromise.then(cache => cache.match(request));
+    event.respondWith((async () => {
+      const tileCache = await caches.open(TILE_CACHE);
 
-    const revalidatePromise = Promise.all([cachePromise, cachedPromise])
-      .then(async ([cache, cached]) => {
-        if (!cached) return;
-        try {
-          await fetchAndCache(cache, request);
-        } catch {
-          // El tile cacheado sigue disponible aunque la red falle.
+      // caches.match tambien encuentra tiles guardados por versiones antiguas
+      // del Service Worker, evitando que el usuario pierda lo ya recorrido.
+      const cached = await caches.match(request);
+
+      if (cached) {
+        if (!(await tileCache.match(request))) {
+          event.waitUntil(tileCache.put(request, cached.clone()));
         }
-      });
 
-    event.waitUntil(revalidatePromise);
+        event.waitUntil(
+          fetchAndCacheTile(tileCache, request).catch(() => null)
+        );
 
-    event.respondWith(
-      Promise.all([cachePromise, cachedPromise]).then(async ([cache, cached]) => {
-        if (cached) return cached;
-        return fetchAndCache(cache, request);
-      })
-    );
+        return cached;
+      }
+
+      return fetchAndCacheTile(tileCache, request);
+    })());
     return;
   }
 
   if (isAsset) {
     event.respondWith((async () => {
-      const cache = await caches.open(CACHE);
+      const cache = await caches.open(ASSET_CACHE);
       const cached = await cache.match(request);
       if (cached) return cached;
 
