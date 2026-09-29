@@ -4,12 +4,14 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --check server.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
     "express": "4.21.2",
     "prismarine-auth": "3.1.1",
-    "prismarine-realms": "1.6.0"
+    "prismarine-realms": "1.6.0",
+    "unzipper": "^0.12.3"
   }
 }
