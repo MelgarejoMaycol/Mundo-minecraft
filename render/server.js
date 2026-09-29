@@ -2,7 +2,9 @@ const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
 const { spawn } = require('child_process')
+const { pipeline } = require('stream/promises')
 const AdmZip = require('adm-zip')
+const unzipper = require('unzipper')
 const express = require('express')
 const { Authflow, Titles } = require('prismarine-auth')
 const { RealmAPI } = require('prismarine-realms')
@@ -20,12 +22,15 @@ const mcworldPath = path.join(downloadDir, 'realm.mcworld')
 const unminedCli = process.env.UNMINED_CLI || path.join(renderDir, '.unmined', 'unmined-cli')
 
 const realmId = String(process.env.REALM_ID || '33911323')
-const updateMinutes = Math.max(60, Number(process.env.UPDATE_INTERVAL_MINUTES || 60))
-const zoomIn = Math.max(0, Number(process.env.ZOOM_IN || 2))
+const updateMinutes = Math.max(60, Number(process.env.UPDATE_INTERVAL_MINUTES || 360))
+const initialUpdateDelaySeconds = Math.max(1, Number(process.env.INITIAL_UPDATE_DELAY_SECONDS || 5))
+const zoomIn = Math.max(0, Number(process.env.ZOOM_IN || 0))
 const zoomOut = Math.max(0, Number(process.env.ZOOM_OUT || 10))
-const clientExtraZoom = Math.max(0, Math.min(6, Number(process.env.CLIENT_EXTRA_ZOOM || 4)))
+const clientExtraZoom = Math.max(0, Math.min(6, Number(process.env.CLIENT_EXTRA_ZOOM || 3)))
 const chunkProcessors = Math.max(1, Number(process.env.UNMINED_CHUNK_PROCESSORS || 1))
 const unminedHeapLimit = process.env.UNMINED_GC_HEAP_LIMIT || '10000000'
+const webpQuality = Math.max(50, Math.min(100, Number(process.env.WEBP_QUALITY || 85)))
+const webpMethod = Math.max(0, Math.min(6, Number(process.env.WEBP_METHOD || 2)))
 const tileCacheSeconds = Math.max(60, Number(process.env.TILE_CACHE_SECONDS || 600))
 const assetCacheSeconds = Math.max(300, Number(process.env.ASSET_CACHE_SECONDS || 3600))
 const refreshToken = String(process.env.REFRESH_TOKEN || '')
@@ -59,12 +64,20 @@ const state = {
   lastSuccessAt: persisted.lastSuccessAt || null,
   lastRealmHash: persisted.lastRealmHash || null,
   lastError: null,
+  lastErrorAt: null,
   lastAction: null,
+  phase: 'idle',
+  renderProgressPercent: null,
+  renderedTileLines: 0,
+  renderStartedAt: null,
+  nextUpdateAt: null,
   updateMinutes,
   zoomIn,
   zoomOut,
   clientExtraZoom,
-  chunkProcessors
+  chunkProcessors,
+  webpQuality,
+  webpMethod
 }
 
 function log (...args) {
@@ -91,6 +104,18 @@ function memorySnapshot () {
     heapTotalMb: Math.round(m.heapTotal / 1024 / 1024),
     externalMb: Math.round(m.external / 1024 / 1024)
   }
+}
+
+function setPhase (phase) {
+  state.phase = phase
+  log(`Fase: ${phase}`)
+}
+
+async function extractWorldArchive (sourcePath, destinationDir) {
+  await pipeline(
+    fs.createReadStream(sourcePath),
+    unzipper.Extract({ path: destinationDir })
+  )
 }
 
 function isTransientNetworkError (error) {
@@ -193,6 +218,7 @@ async function getRealms (api) {
 }
 
 async function downloadRealm ({ force = false } = {}) {
+  setPhase('consultando-realm')
   const api = createApi()
   const realms = await getRealms(api)
   const realm = realms.find(item => String(item.id) === realmId)
@@ -212,6 +238,7 @@ async function downloadRealm ({ force = false } = {}) {
     () => api.getRealmWorldDownload(String(realm.id), slotId, 'latest')
   )
 
+  setPhase('descargando-realm')
   let buffer = await withRetry(
     'descargar archivo del mundo',
     () => download.getBuffer()
@@ -238,8 +265,8 @@ async function downloadRealm ({ force = false } = {}) {
   fs.rmSync(nextWorldDir, { recursive: true, force: true })
   fs.mkdirSync(nextWorldDir, { recursive: true })
 
-  const zip = new AdmZip(mcworldPath)
-  zip.extractAllTo(nextWorldDir, true)
+  setPhase('extrayendo-mundo')
+  await extractWorldArchive(mcworldPath, nextWorldDir)
   fs.rmSync(mcworldPath, { force: true })
   compactMemory()
 
@@ -252,6 +279,34 @@ async function downloadRealm ({ force = false } = {}) {
   fs.renameSync(nextWorldDir, worldDir)
 
   return { changed: true, hash: realmHash, realmName: realm.name, activeSlot: slotId }
+}
+
+function parseUnminedLine (line) {
+  const progress = line.match(/\[(\d+(?:\.\d+)?)%\]/)
+  if (progress) {
+    state.renderProgressPercent = Math.max(0, Math.min(100, Number(progress[1])))
+  }
+
+  if (/Rendering tile\b/i.test(line)) {
+    state.renderedTileLines += 1
+  }
+}
+
+function pipeProcessOutput (stream, target) {
+  let pending = ''
+
+  stream.on('data', chunk => {
+    target.write(chunk)
+    pending += chunk.toString('utf8')
+
+    const lines = pending.split(/\r?\n/)
+    pending = lines.pop() || ''
+    for (const line of lines) parseUnminedLine(line)
+  })
+
+  stream.on('end', () => {
+    if (pending) parseUnminedLine(pending)
+  })
 }
 
 function runProcess (command, args) {
@@ -271,9 +326,12 @@ function runProcess (command, args) {
     const finalArgs = useNice ? ['-n', '15', command, ...args] : args
 
     const child = spawn(executable, finalArgs, {
-      stdio: ['ignore', 'inherit', 'inherit'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       env: childEnv
     })
+
+    pipeProcessOutput(child.stdout, process.stdout)
+    pipeProcessOutput(child.stderr, process.stderr)
 
     child.on('error', reject)
     child.on('exit', (code, signal) => {
@@ -289,13 +347,17 @@ function injectServiceWorkerRegistration () {
   if (!fs.existsSync(index)) return
 
   let html = fs.readFileSync(index, 'utf8')
-  if (html.includes('/sw.js')) return
+  if (html.includes('OCAYORK_STORAGE_PERSIST_V2')) return
 
   const registration = `
 <script>
+/* OCAYORK_STORAGE_PERSIST_V2 */
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
+    if (navigator.storage && navigator.storage.persist) {
+      navigator.storage.persist().catch(() => {});
+    }
   });
 }
 </script>
@@ -342,9 +404,10 @@ function applyClientRendererEnhancements () {
       `const dpiScale = window.devicePixelRatio ?? 1.0;
         /* OCAYORK_CLIENT_OVERZOOM */
         const clientExtraZoom = Math.max(0, this.#options.clientExtraZoom ?? 0);
-        const deviceMemory = navigator.deviceMemory ?? 4;
-        const clientTileCacheSize = deviceMemory >= 8 ? 2048 : (deviceMemory >= 4 ? 1024 : 512);
-        const clientPreload = deviceMemory >= 8 ? 3 : (deviceMemory >= 4 ? 2 : 1);`
+        const isMobile = window.matchMedia?.('(pointer: coarse)')?.matches || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const deviceMemory = navigator.deviceMemory ?? (isMobile ? 2 : 4);
+        const clientTileCacheSize = isMobile ? 256 : (deviceMemory >= 8 ? 1024 : 512);
+        const clientPreload = isMobile ? 1 : (deviceMemory >= 8 ? 2 : 1);`
     )
 
     viewer = viewer.replace(
@@ -428,6 +491,10 @@ async function renderMap () {
   }
 
   fs.mkdirSync(mapDir, { recursive: true })
+  setPhase('renderizando-mapa')
+  state.renderProgressPercent = 0
+  state.renderedTileLines = 0
+  state.renderStartedAt = new Date().toISOString()
 
   const args = [
     'web',
@@ -436,15 +503,17 @@ async function renderMap () {
     `--output=${mapDir}`,
     '--imageformat=webp',
     '--webp-format=lossy',
-    '--webp-quality=90',
-    '--webp-method=3',
+    `--webp-quality=${webpQuality}`,
+    `--webp-method=${webpMethod}`,
     `--chunkprocessors=${chunkProcessors}`,
     `--zoomin=${zoomIn}`,
     `--zoomout=${zoomOut}`
   ]
 
-  log(`Generando mapa: zoom-in ${zoomIn}, zoom-out ${zoomOut}, chunkprocessors ${chunkProcessors}`)
+  log(`Generando mapa: zoom-in ${zoomIn}, zoom-out ${zoomOut}, chunkprocessors ${chunkProcessors}, WebP q${webpQuality}/m${webpMethod}`)
   await runProcess(unminedCli, args)
+  state.renderProgressPercent = 100
+  setPhase('finalizando-mapa')
 
   const unminedIndex = path.join(mapDir, 'unmined.index.html')
   const index = path.join(mapDir, 'index.html')
@@ -478,7 +547,12 @@ async function updateMap ({ force = false } = {}) {
   state.running = true
   state.lastStartedAt = new Date().toISOString()
   state.lastError = null
+  state.lastErrorAt = null
+  state.renderProgressPercent = null
+  state.renderedTileLines = 0
+  state.renderStartedAt = null
   state.lastAction = force ? 'actualizacion manual forzada' : 'actualizacion programada'
+  setPhase('iniciando')
 
   try {
     log(`=== Iniciando ${state.lastAction} ===`)
@@ -493,6 +567,7 @@ async function updateMap ({ force = false } = {}) {
       state.lastAction = 'sin cambios; render omitido; caché cliente verificada'
     }
 
+    setPhase('idle')
     state.lastRealmHash = result.hash
     state.lastSuccessAt = new Date().toISOString()
 
@@ -506,7 +581,9 @@ async function updateMap ({ force = false } = {}) {
     log(`=== Actualizacion correcta: ${state.lastAction} ===`)
     return true
   } catch (error) {
-    state.lastError = error.stack || error.message || String(error)
+    state.lastError = error.message || String(error)
+    state.lastErrorAt = new Date().toISOString()
+    setPhase('error')
     log('ERROR actualizando mapa:', error)
     return false
   } finally {
@@ -540,8 +617,10 @@ h1{margin-top:0}.muted{color:#9ca3af}code,pre{background:#111827;border-radius:8
 ${state.running ? 'Actualizando el Realm ahora mismo…' : state.ready ? 'Mapa listo.' : 'Preparando el primer mapa…'}
 </p>
 <p>Realm: <strong>${state.realmName || realmId}</strong></p>
-<p>Actualizacion: cada <strong>${updateMinutes} minutos</strong>. Zoom: +${zoomIn} / -${zoomOut}.</p>
+<p>Actualizacion: cada <strong>${updateMinutes} minutos después de terminar la anterior</strong>. Zoom real: +${zoomIn} / -${zoomOut}; zoom cliente: +${clientExtraZoom}.</p>
+<p>Fase: <strong>${state.phase}</strong>${state.renderProgressPercent != null ? ` · render ${state.renderProgressPercent.toFixed(2)}%` : ''}</p>
 <p class="muted">Ultima actualizacion correcta: ${state.lastSuccessAt || 'todavia ninguna'}</p>
+<p class="muted">Proxima comprobacion: ${state.nextUpdateAt || 'se programará al terminar la actual'}</p>
 ${safeError ? `<h2 class="bad">Ultimo error</h2><pre>${safeError}</pre>` : ''}
 <script>setTimeout(()=>location.reload(),15000)</script>
 </main></body></html>`
@@ -597,12 +676,11 @@ app.all('/refresh', (req, res) => {
   res.status(202).json({ ok: true, accepted: true, force })
 })
 
-// Service Worker persistente: conserva todos los tiles visitados.
-// Devuelve inmediatamente el tile cacheado y lo revalida en segundo plano.
+// Service Worker persistente: se mantiene en un unico archivo versionado del repositorio.
 app.get('/sw.js', (_req, res) => {
   res.set('Content-Type', 'application/javascript; charset=utf-8')
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate')
-  res.send("/* OCAYORK_PERSISTENT_MAP_CACHE\n   Conserva todos los tiles visitados. No hay poda intencional por cantidad.\n   Los tiles cacheados se muestran al instante y se revalidan en segundo plano. */\nconst CACHE = 'ocayork-map-v4-persistent';\n\nasync function fetchAndCache(cache, request) {\n  const response = await fetch(new Request(request, { cache: 'no-cache' }));\n  const contentType = response.headers.get('content-type') || '';\n  if (response.ok && contentType.startsWith('image/')) {\n    await cache.put(request, response.clone());\n  }\n  return response;\n}\n\nself.addEventListener('install', event => {\n  event.waitUntil(self.skipWaiting());\n});\n\nself.addEventListener('activate', event => {\n  event.waitUntil((async () => {\n    const names = await caches.keys();\n    await Promise.all(\n      names\n        .filter(name => name.startsWith('ocayork-map-') && name !== CACHE)\n        .map(name => caches.delete(name))\n    );\n    await self.clients.claim();\n  })());\n});\n\nself.addEventListener('fetch', event => {\n  const request = event.request;\n  if (request.method !== 'GET') return;\n\n  const url = new URL(request.url);\n  if (url.origin !== self.location.origin) return;\n\n  const path = url.pathname.toLowerCase();\n  const isTile = path.endsWith('.webp') || path.includes('/tiles/');\n  const isAsset = /\\.(js|css|png|jpg|jpeg|svg|woff2?)$/.test(path);\n\n  if (isTile) {\n    const cachePromise = caches.open(CACHE);\n    const cachedPromise = cachePromise.then(cache => cache.match(request));\n\n    const revalidatePromise = Promise.all([cachePromise, cachedPromise])\n      .then(async ([cache, cached]) => {\n        if (!cached) return;\n        try {\n          await fetchAndCache(cache, request);\n        } catch {\n          // El tile cacheado sigue disponible aunque la red falle.\n        }\n      });\n\n    event.waitUntil(revalidatePromise);\n\n    event.respondWith(\n      Promise.all([cachePromise, cachedPromise]).then(async ([cache, cached]) => {\n        if (cached) return cached;\n        return fetchAndCache(cache, request);\n      })\n    );\n    return;\n  }\n\n  if (isAsset) {\n    event.respondWith((async () => {\n      const cache = await caches.open(CACHE);\n      const cached = await cache.match(request);\n      if (cached) return cached;\n\n      const response = await fetch(request);\n      if (response.ok) await cache.put(request, response.clone());\n      return response;\n    })());\n  }\n});\n")
+  res.sendFile(path.join(repoDir, 'sw.js'))
 })
 
 app.use(express.static(mapDir, {
@@ -654,14 +732,33 @@ app.get('*', (_req, res) => {
 fs.mkdirSync(dataDir, { recursive: true })
 restoreAuthCacheFromEnv()
 
+let updateTimer = null
+
+function scheduleNextUpdate () {
+  if (updateTimer) clearTimeout(updateTimer)
+
+  const delayMs = updateMinutes * 60 * 1000
+  state.nextUpdateAt = new Date(Date.now() + delayMs).toISOString()
+
+  updateTimer = setTimeout(async () => {
+    state.nextUpdateAt = null
+    await updateMap()
+    scheduleNextUpdate()
+  }, delayMs)
+}
+
 app.listen(port, '0.0.0.0', () => {
   log(`Servidor web escuchando en puerto ${port}`)
   log(`Realm ID: ${realmId}`)
-  log(`Actualizacion del mapa cada ${updateMinutes} minutos`)
+  log(`Actualizacion secuencial: ${updateMinutes} minutos despues de terminar cada ciclo`)
   log(`Zoom real servidor: +${zoomIn}/-${zoomOut}; overzoom cliente adicional: +${clientExtraZoom}; chunkprocessors: ${chunkProcessors}`)
-  log(`Cache: tiles ${tileCacheSeconds}s, assets ${assetCacheSeconds}s, SW persistente sin poda intencional`)
+  log(`WebP: calidad ${webpQuality}, metodo ${webpMethod}`)
+  log(`Cache: tiles ${tileCacheSeconds}s, assets ${assetCacheSeconds}s, SW persistente separado`)
+  log(`DATA_DIR: ${dataDir}`)
   log('Keepalive liviano disponible en /ping')
 
-  setTimeout(() => updateMap(), 1000)
-  setInterval(() => updateMap(), updateMinutes * 60 * 1000)
+  setTimeout(async () => {
+    await updateMap()
+    scheduleNextUpdate()
+  }, initialUpdateDelaySeconds * 1000)
 })
