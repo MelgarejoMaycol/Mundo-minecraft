@@ -128,9 +128,19 @@ function isTransientNetworkError (error) {
     'ESOCKETTIMEDOUT',
     'ECONNRESET',
     'ECONNREFUSED',
+    'ECONNABORTED',
     'EAI_AGAIN',
     'ENETUNREACH',
     'EHOSTUNREACH',
+    'EPIPE',
+    'ABORT_ERR',
+    'ERR_STREAM_PREMATURE_CLOSE',
+    'PREMATURE CLOSE',
+    'SOCKET HANG UP',
+    'INVALID RESPONSE BODY',
+    'FETCHERROR',
+    'UND_ERR',
+    'DOWNLOAD INCOMPLETA',
     '429',
     '500',
     '502',
@@ -233,23 +243,48 @@ async function downloadRealm ({ force = false } = {}) {
 
   log(`Realm: ${realm.name} | ID: ${realm.id} | slot: ${slotId}`)
 
-  const download = await withRetry(
-    'solicitar enlace de descarga del Realm',
-    () => api.getRealmWorldDownload(String(realm.id), slotId, 'latest')
-  )
-
   setPhase('descargando-realm')
-  let buffer = await withRetry(
+
+  // El enlace que entrega Realms puede caducar o la descarga CDN puede cerrar
+  // el stream antes de tiempo ("Premature close"). Cada reintento solicita
+  // un enlace NUEVO y vuelve a descargar desde cero para no reutilizar una
+  // respuesta rota.
+  const downloadResult = await withRetry(
     'descargar archivo del mundo',
-    () => download.getBuffer()
+    async () => {
+      const download = await api.getRealmWorldDownload(String(realm.id), slotId, 'latest')
+      const candidate = await download.getBuffer()
+      const expectedBytes = Number(download.size || 0)
+
+      if (!candidate || candidate.length === 0) {
+        throw new Error('Descarga incompleta: Realms devolvio un archivo vacio')
+      }
+
+      if (expectedBytes > 0 && candidate.length !== expectedBytes) {
+        throw new Error(
+          `Descarga incompleta: recibidos ${candidate.length} bytes de ${expectedBytes}`
+        )
+      }
+
+      return {
+        buffer: candidate,
+        expectedBytes
+      }
+    },
+    7
   )
 
+  let buffer = downloadResult.buffer
   const bytes = buffer.length
   const realmHash = crypto.createHash('sha256').update(buffer).digest('hex')
 
   fs.mkdirSync(downloadDir, { recursive: true })
   fs.writeFileSync(mcworldPath, buffer)
-  log(`Realm descargado: ${(bytes / 1024 / 1024).toFixed(2)} MB | hash: ${realmHash.slice(0, 12)}`)
+  log(
+    `Realm descargado y verificado: ${(bytes / 1024 / 1024).toFixed(2)} MB` +
+    `${downloadResult.expectedBytes > 0 ? ` / esperado ${(downloadResult.expectedBytes / 1024 / 1024).toFixed(2)} MB` : ''}` +
+    ` | hash: ${realmHash.slice(0, 12)}`
+  )
 
   buffer = null
   compactMemory()
