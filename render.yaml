@@ -14,7 +14,7 @@ services:
       - key: UPDATE_INTERVAL_MINUTES
         value: "60"
       - key: ZOOM_IN
-        value: "2"
+        value: "0"
       - key: ZOOM_OUT
         value: "10"
       - key: CLIENT_EXTRA_ZOOM
