@@ -2,7 +2,6 @@ const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
 const { spawn } = require('child_process')
-const { pipeline } = require('stream/promises')
 const AdmZip = require('adm-zip')
 const unzipper = require('unzipper')
 const express = require('express')
@@ -112,10 +111,22 @@ function setPhase (phase) {
 }
 
 async function extractWorldArchive (sourcePath, destinationDir) {
-  await pipeline(
-    fs.createReadStream(sourcePath),
-    unzipper.Extract({ path: destinationDir })
-  )
+  // Open.file lee primero el directorio central del ZIP y extrae los archivos
+  // individualmente. Es mas estable para los .mcworld grandes de Realms que
+  // envolver unzipper.Extract() en stream.pipeline(), que puede interpretar
+  // el cierre normal de Extract como ERR_STREAM_PREMATURE_CLOSE.
+  const archive = await unzipper.Open.file(sourcePath)
+  const paths = archive.files.map(entry => entry.path.replace(/\\/g, '/'))
+
+  const hasLevelDat = paths.includes('level.dat')
+  const hasDatabase = paths.some(entryPath => entryPath.startsWith('db/'))
+
+  if (!hasLevelDat || !hasDatabase) {
+    throw new Error('El .mcworld descargado no contiene level.dat y db/.')
+  }
+
+  log(`Archivo .mcworld validado: ${archive.files.length} entradas. Extrayendo con concurrencia 1.`)
+  await archive.extract({ path: destinationDir, concurrency: 1 })
 }
 
 function isTransientNetworkError (error) {
@@ -254,21 +265,25 @@ async function downloadRealm ({ force = false } = {}) {
     async () => {
       const download = await api.getRealmWorldDownload(String(realm.id), slotId, 'latest')
       const candidate = await download.getBuffer()
-      const expectedBytes = Number(download.size || 0)
+      const reportedBytes = Number(download.size || 0)
 
       if (!candidate || candidate.length === 0) {
         throw new Error('Descarga incompleta: Realms devolvio un archivo vacio')
       }
 
-      if (expectedBytes > 0 && candidate.length !== expectedBytes) {
-        throw new Error(
-          `Descarga incompleta: recibidos ${candidate.length} bytes de ${expectedBytes}`
+      // data.size de la API de Realms no siempre coincide con el archivo que
+      // entrega el enlace CDN. No rechazamos una descarga solo por esa cifra:
+      // la validez real se comprueba abriendo el ZIP y buscando level.dat/db.
+      if (reportedBytes > 0 && candidate.length !== reportedBytes) {
+        log(
+          `Aviso: Realms reporto ${reportedBytes} bytes, pero el CDN entrego ${candidate.length}. ` +
+          'Se validara el contenido del .mcworld antes de extraer.'
         )
       }
 
       return {
         buffer: candidate,
-        expectedBytes
+        reportedBytes
       }
     },
     7
@@ -281,8 +296,8 @@ async function downloadRealm ({ force = false } = {}) {
   fs.mkdirSync(downloadDir, { recursive: true })
   fs.writeFileSync(mcworldPath, buffer)
   log(
-    `Realm descargado y verificado: ${(bytes / 1024 / 1024).toFixed(2)} MB` +
-    `${downloadResult.expectedBytes > 0 ? ` / esperado ${(downloadResult.expectedBytes / 1024 / 1024).toFixed(2)} MB` : ''}` +
+    `Realm descargado: ${(bytes / 1024 / 1024).toFixed(2)} MB` +
+    `${downloadResult.reportedBytes > 0 ? ` / API reporta ${(downloadResult.reportedBytes / 1024 / 1024).toFixed(2)} MB` : ''}` +
     ` | hash: ${realmHash.slice(0, 12)}`
   )
 
