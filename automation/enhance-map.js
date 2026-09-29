@@ -29,9 +29,10 @@ if (!viewer.includes('OCAYORK_PERSISTENT_TILE_CACHE')) {
     '        const dpiScale = window.devicePixelRatio ?? 1.0;',
     `        const dpiScale = window.devicePixelRatio ?? 1.0;
         /* OCAYORK_PERSISTENT_TILE_CACHE */
-        const deviceMemory = navigator.deviceMemory ?? 4;
-        const clientTileCacheSize = deviceMemory >= 8 ? 2048 : (deviceMemory >= 4 ? 1024 : 512);
-        const clientPreload = deviceMemory >= 8 ? 3 : (deviceMemory >= 4 ? 2 : 1);`,
+        const isMobile = window.matchMedia?.('(pointer: coarse)')?.matches || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const deviceMemory = navigator.deviceMemory ?? (isMobile ? 2 : 4);
+        const clientTileCacheSize = isMobile ? 256 : (deviceMemory >= 8 ? 1024 : 512);
+        const clientPreload = isMobile ? 1 : (deviceMemory >= 8 ? 2 : 1);`,
     'cache cliente'
   );
 
