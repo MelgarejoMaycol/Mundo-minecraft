@@ -15,3 +15,19 @@ jobs:
           node-version: 22
       - run: npm install
       - run: npm test
+      - name: Smoke test HTTP
+        run: |
+          INITIAL_UPDATE_DELAY_SECONDS=3600 UPDATE_INTERVAL_MINUTES=360 PORT=18080 npm start > /tmp/ocayork-smoke.log 2>&1 &
+          APP_PID=$!
+          trap 'kill $APP_PID || true; cat /tmp/ocayork-smoke.log' EXIT
+          for i in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:18080/health > /tmp/health.json; then break; fi
+            sleep 0.5
+          done
+          curl --fail --silent http://127.0.0.1:18080/ping | grep '"ok":true'
+          curl --fail --silent http://127.0.0.1:18080/status | grep '"phase":"idle"'
+          curl --fail --silent http://127.0.0.1:18080/sw.js | grep 'OCAYORK_PERSISTENT_MAP_CACHE_V5'
+          kill $APP_PID
+          wait $APP_PID || true
+          trap - EXIT
+          cat /tmp/ocayork-smoke.log
